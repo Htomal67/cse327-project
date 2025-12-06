@@ -9,10 +9,10 @@ app = Flask(__name__)
 app.secret_key = 'super_secret_dailydash_key'
 DATABASE = 'dailydash.db'
 
-# ==========================================
+
 # PATTERN 1: SINGLETON PATTERN
 # Purpose: Ensure only one Database connection helper exists
-# ==========================================
+
 class DBConnection:
     _instance = None
 
@@ -73,10 +73,10 @@ def init_db():
         
         db.commit()
 
-# ==========================================
+
 # PATTERN 2: DECORATOR PATTERN
 # Purpose: Protect routes that require specific roles (Admin/User)
-# ==========================================
+
 def login_required(f):
     @wraps(f)
     def decorated_function(*args, **kwargs):
@@ -93,10 +93,10 @@ def admin_required(f):
         return f(*args, **kwargs)
     return decorated_function
 
-# ==========================================
+
 # PATTERN 3: ADAPTER PATTERN
 # Purpose: Convert raw RSS feed items into our standard JSON structure
-# ==========================================
+
 class RSSAdapter:
     @staticmethod
     def adapt(entry, source_name, source_category):
@@ -117,10 +117,10 @@ class RSSAdapter:
             'image': image
         }
 
-# ==========================================
+
 # PATTERN 4: STRATEGY PATTERN
 # Purpose: Encapsulate filtering logic
-# ==========================================
+
 class NewsFilterStrategy:
     def filter(self, articles, criteria):
         pass
@@ -249,4 +249,5 @@ def get_news():
 
 if __name__ == '__main__':
     init_db()
+
     app.run(debug=True)
