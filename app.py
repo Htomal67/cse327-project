@@ -2,17 +2,18 @@ import sqlite3
 import feedparser
 from flask import Flask, render_template, request, jsonify, g, session
 from functools import wraps
-import hashlib
-import os
+import time
+from datetime import datetime
+import threading
+import copy
 
 app = Flask(__name__)
 app.secret_key = 'super_secret_dailydash_key'
 DATABASE = 'dailydash.db'
 
-
+# ==========================================
 # PATTERN 1: SINGLETON PATTERN
-# Purpose: Ensure only one Database connection helper exists
-
+# ==========================================
 class DBConnection:
     _instance = None
 
@@ -34,7 +35,6 @@ def init_db():
     with app.app_context():
         db = db_instance.get_db()
         cursor = db.cursor()
-        # Users Table
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS users (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -45,7 +45,6 @@ def init_db():
                 preferences TEXT
             )
         ''')
-        # Sources Table
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS sources (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -55,13 +54,11 @@ def init_db():
             )
         ''')
         
-        # Seed Admin
         cursor.execute("SELECT * FROM users WHERE email = 'admin@dailydash.com'")
         if not cursor.fetchone():
             cursor.execute("INSERT INTO users (email, password, name, role) VALUES (?, ?, ?, ?)",
                            ('admin@dailydash.com', 'admin123', 'System Admin', 'admin'))
         
-        # Seed Sources
         cursor.execute("SELECT * FROM sources")
         if not cursor.fetchall():
             default_sources = [
@@ -73,10 +70,9 @@ def init_db():
         
         db.commit()
 
-
+# ==========================================
 # PATTERN 2: DECORATOR PATTERN
-# Purpose: Protect routes that require specific roles (Admin/User)
-
+# ==========================================
 def login_required(f):
     @wraps(f)
     def decorated_function(*args, **kwargs):
@@ -85,58 +81,122 @@ def login_required(f):
         return f(*args, **kwargs)
     return decorated_function
 
-def admin_required(f):
-    @wraps(f)
-    def decorated_function(*args, **kwargs):
-        if 'role' not in session or session['role'] != 'admin':
-            return jsonify({'error': 'Forbidden'}), 403
-        return f(*args, **kwargs)
-    return decorated_function
-
-
+# ==========================================
 # PATTERN 3: ADAPTER PATTERN
-# Purpose: Convert raw RSS feed items into our standard JSON structure
-
+# ==========================================
 class RSSAdapter:
     @staticmethod
     def adapt(entry, source_name, source_category):
-        # Extract image if available (Media RSS or Enclosure)
-        image = 'https://via.placeholder.com/150'
+        image = 'https://via.placeholder.com/300?text=News'
         if 'media_content' in entry:
             image = entry.media_content[0]['url']
         elif 'media_thumbnail' in entry:
             image = entry.media_thumbnail[0]['url']
+        elif 'links' in entry:
+            for link in entry.links:
+                if link.type.startswith('image/'):
+                    image = link.href
+                    break
         
+        timestamp = 0
+        if hasattr(entry, 'published_parsed') and entry.published_parsed:
+            timestamp = time.mktime(entry.published_parsed)
+        elif hasattr(entry, 'updated_parsed') and entry.updated_parsed:
+            timestamp = time.mktime(entry.updated_parsed)
+            
         return {
             'title': entry.get('title', 'No Title'),
             'summary': entry.get('summary', 'No summary available.')[:200] + '...',
             'link': entry.get('link', '#'),
             'date': entry.get('published', ''),
+            'timestamp': timestamp,
             'source': source_name,
             'category': source_category,
             'image': image
         }
 
+# ==========================================
+# BACKGROUND NEWS FETCHER (Proxy/Singleton)
+# ==========================================
+class NewsFetcher:
+    _instance = None
+    
+    def __new__(cls):
+        if cls._instance is None:
+            cls._instance = super(NewsFetcher, cls).__new__(cls)
+            cls._instance.articles = []
+            cls._instance.lock = threading.Lock()
+            cls._instance.start_background_thread()
+        return cls._instance
 
+    def start_background_thread(self):
+        thread = threading.Thread(target=self.update_loop, daemon=True)
+        thread.start()
+
+    def update_loop(self):
+        self.fetch_all_sources()
+        while True:
+            time.sleep(300)
+            self.fetch_all_sources()
+
+    def fetch_all_sources(self):
+        print("--- [Background] Fetching News Sources... ---")
+        try:
+            with sqlite3.connect(DATABASE) as conn:
+                conn.row_factory = sqlite3.Row
+                sources = conn.execute("SELECT * FROM sources").fetchall()
+                
+                new_articles = []
+                for source in sources:
+                    try:
+                        feed = feedparser.parse(source['url'])
+                        for entry in feed.entries:
+                            new_articles.append(RSSAdapter.adapt(entry, source['name'], source['category']))
+                    except Exception as e:
+                        print(f"Error fetching {source['name']}: {e}")
+                
+                new_articles.sort(key=lambda x: x['timestamp'], reverse=True)
+                
+                with self.lock:
+                    self.articles = new_articles
+                print(f"--- [Background] Updated {len(new_articles)} articles ---")
+                
+        except Exception as e:
+            print(f"Background Fetch Error: {e}")
+
+    def get_cached_articles(self):
+        with self.lock:
+            return copy.deepcopy(self.articles)
+
+    def refresh_now(self):
+        threading.Thread(target=self.fetch_all_sources, daemon=True).start()
+
+news_fetcher = NewsFetcher()
+
+# ==========================================
 # PATTERN 4: STRATEGY PATTERN
-# Purpose: Encapsulate filtering logic
-
-class NewsFilterStrategy:
-    def filter(self, articles, criteria):
-        pass
-
-class CategoryStrategy(NewsFilterStrategy):
+# ==========================================
+class CategoryStrategy:
     def filter(self, articles, category):
         if category == 'All':
             return articles
         return [a for a in articles if a['category'].lower() == category.lower()]
 
-class PreferenceStrategy(NewsFilterStrategy):
+class PreferenceStrategy:
     def filter(self, articles, user_prefs):
         if not user_prefs:
             return articles
-        prefs_list = user_prefs.split(',')
-        return [a for a in articles if a['category'] in prefs_list]
+        prefs_list = [p.strip().lower() for p in user_prefs.split(',')]
+        return [a for a in articles if a['category'].lower() in prefs_list]
+
+# NEW: Search Strategy
+class SearchStrategy:
+    def filter(self, articles, query):
+        if not query:
+            return articles
+        q = query.lower()
+        # Search in Title OR Summary
+        return [a for a in articles if q in a['title'].lower() or q in a['summary'].lower()]
 
 # --- ROUTES ---
 
@@ -149,6 +209,18 @@ def close_connection(exception):
 @app.route('/')
 def index():
     return render_template('index.html')
+
+@app.route('/api/check_auth', methods=['GET'])
+def check_auth():
+    if 'user_id' in session:
+        db = db_instance.get_db()
+        user = db.execute("SELECT * FROM users WHERE id = ?", (session['user_id'],)).fetchone()
+        if user:
+            return jsonify({
+                'authenticated': True,
+                'user': {'id': user['id'], 'name': user['name'], 'role': user['role'], 'preferences': user['preferences']}
+            })
+    return jsonify({'authenticated': False})
 
 @app.route('/api/login', methods=['POST'])
 def login():
@@ -167,14 +239,19 @@ def login():
         })
     return jsonify({'success': False, 'message': 'Invalid credentials'})
 
+@app.route('/api/logout', methods=['POST'])
+def logout():
+    session.clear()
+    return jsonify({'success': True})
+
 @app.route('/api/signup', methods=['POST'])
 def signup():
     data = request.json
     db = db_instance.get_db()
     cursor = db.cursor()
     try:
-        # Simple Logic: First user created is admin, else reader
-        role = 'reader' 
+        role = data.get('role', 'reader')
+        if role not in ['reader', 'admin']: role = 'reader'
         cursor.execute("INSERT INTO users (email, password, name, role) VALUES (?, ?, ?, ?)",
                        (data['email'], data['password'], data['name'], role))
         db.commit()
@@ -201,12 +278,12 @@ def manage_sources():
         return jsonify([dict(row) for row in cur.fetchall()])
     
     if request.method == 'POST':
-        # @admin_required check manually applied here for brevity in demo
         if session.get('role') != 'admin': return jsonify({'error': 'Forbidden'}), 403
         data = request.json
         db.execute("INSERT INTO sources (name, url, category) VALUES (?, ?, ?)", 
                    (data['name'], data['url'], data['category']))
         db.commit()
+        news_fetcher.refresh_now()
         return jsonify({'success': True})
 
     if request.method == 'DELETE':
@@ -218,36 +295,33 @@ def manage_sources():
 
 @app.route('/api/news', methods=['GET'])
 def get_news():
-    db = db_instance.get_db()
-    sources = db.execute("SELECT * FROM sources").fetchall()
+    # 1. Fetch from Memory
+    all_articles = news_fetcher.get_cached_articles()
+    filtered = all_articles
     
-    all_articles = []
-    
-    # RSS Fetching
-    for source in sources:
-        feed = feedparser.parse(source['url'])
-        for entry in feed.entries:
-            all_articles.append(RSSAdapter.adapt(entry, source['name'], source['category']))
-    
-    # Filtering Strategy Execution
+    # 2. Apply Category/Preference Filters (Primary Filter)
     filter_type = request.args.get('filter_type', 'All')
     filter_value = request.args.get('filter_value', '')
     
-    filtered = all_articles
     if filter_type == 'Category':
         strategy = CategoryStrategy()
-        filtered = strategy.filter(all_articles, filter_value)
+        filtered = strategy.filter(filtered, filter_value)
     elif filter_type == 'Preferences':
-        # Fetch current user prefs
         if 'user_id' in session:
+            db = db_instance.get_db()
             user = db.execute("SELECT preferences FROM users WHERE id = ?", (session['user_id'],)).fetchone()
             if user and user['preferences']:
                 strategy = PreferenceStrategy()
-                filtered = strategy.filter(all_articles, user['preferences'])
+                filtered = strategy.filter(filtered, user['preferences'])
+
+    # 3. Apply Search Filter (Secondary Filter)
+    search_query = request.args.get('search', '').strip()
+    if search_query:
+        search_strategy = SearchStrategy()
+        filtered = search_strategy.filter(filtered, search_query)
 
     return jsonify(filtered)
 
 if __name__ == '__main__':
     init_db()
-
     app.run(debug=True)
