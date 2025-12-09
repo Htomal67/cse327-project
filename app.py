@@ -6,6 +6,7 @@ import time
 from datetime import datetime
 import threading
 import copy
+import json
 
 app = Flask(__name__)
 app.secret_key = 'super_secret_dailydash_key'
@@ -53,6 +54,21 @@ def init_db():
                 category TEXT NOT NULL
             )
         ''')
+        # NEW: Bookmarks Table
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS bookmarks (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                title TEXT,
+                link TEXT,
+                source TEXT,
+                category TEXT,
+                image TEXT,
+                summary TEXT,
+                timestamp REAL,
+                UNIQUE(user_id, link)
+            )
+        ''')
         
         cursor.execute("SELECT * FROM users WHERE email = 'admin@dailydash.com'")
         if not cursor.fetchone():
@@ -80,6 +96,56 @@ def login_required(f):
             return jsonify({'error': 'Unauthorized'}), 401
         return f(*args, **kwargs)
     return decorated_function
+
+# ==========================================
+# NEW: COMMAND PATTERN (For Undo/Redo)
+# Purpose: Encapsulate bookmark operations to allow reversal
+# ==========================================
+class Command:
+    def execute(self): pass
+    def undo(self): pass
+
+class AddBookmarkCommand(Command):
+    def __init__(self, db, user_id, article):
+        self.db = db
+        self.user_id = user_id
+        self.article = article
+
+    def execute(self):
+        self.db.execute('''
+            INSERT OR IGNORE INTO bookmarks 
+            (user_id, title, link, source, category, image, summary, timestamp) 
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        ''', (self.user_id, self.article['title'], self.article['link'], 
+              self.article['source'], self.article['category'], 
+              self.article['image'], self.article['summary'], time.time()))
+        self.db.commit()
+
+    def undo(self):
+        self.db.execute("DELETE FROM bookmarks WHERE user_id = ? AND link = ?", 
+                        (self.user_id, self.article['link']))
+        self.db.commit()
+
+class RemoveBookmarkCommand(Command):
+    def __init__(self, db, user_id, article):
+        self.db = db
+        self.user_id = user_id
+        self.article = article
+
+    def execute(self):
+        self.db.execute("DELETE FROM bookmarks WHERE user_id = ? AND link = ?", 
+                        (self.user_id, self.article['link']))
+        self.db.commit()
+
+    def undo(self):
+        self.db.execute('''
+            INSERT OR IGNORE INTO bookmarks 
+            (user_id, title, link, source, category, image, summary, timestamp) 
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        ''', (self.user_id, self.article['title'], self.article['link'], 
+              self.article['source'], self.article['category'], 
+              self.article['image'], self.article['summary'], time.time()))
+        self.db.commit()
 
 # ==========================================
 # PATTERN 3: ADAPTER PATTERN
@@ -189,13 +255,11 @@ class PreferenceStrategy:
         prefs_list = [p.strip().lower() for p in user_prefs.split(',')]
         return [a for a in articles if a['category'].lower() in prefs_list]
 
-# NEW: Search Strategy
 class SearchStrategy:
     def filter(self, articles, query):
         if not query:
             return articles
         q = query.lower()
-        # Search in Title OR Summary
         return [a for a in articles if q in a['title'].lower() or q in a['summary'].lower()]
 
 # --- ROUTES ---
@@ -233,6 +297,8 @@ def login():
     if user:
         session['user_id'] = user['id']
         session['role'] = user['role']
+        # Clear command history on login
+        session['command_history'] = [] 
         return jsonify({
             'success': True,
             'user': {'id': user['id'], 'name': user['name'], 'role': user['role'], 'preferences': user['preferences']}
@@ -272,11 +338,9 @@ def save_preferences():
 @app.route('/api/sources', methods=['GET', 'POST', 'DELETE'])
 def manage_sources():
     db = db_instance.get_db()
-    
     if request.method == 'GET':
         cur = db.execute("SELECT * FROM sources")
         return jsonify([dict(row) for row in cur.fetchall()])
-    
     if request.method == 'POST':
         if session.get('role') != 'admin': return jsonify({'error': 'Forbidden'}), 403
         data = request.json
@@ -285,7 +349,6 @@ def manage_sources():
         db.commit()
         news_fetcher.refresh_now()
         return jsonify({'success': True})
-
     if request.method == 'DELETE':
         if session.get('role') != 'admin': return jsonify({'error': 'Forbidden'}), 403
         source_id = request.args.get('id')
@@ -293,13 +356,77 @@ def manage_sources():
         db.commit()
         return jsonify({'success': True})
 
+# --- BOOKMARK ROUTES (NEW) ---
+
+@app.route('/api/bookmarks', methods=['GET', 'POST', 'DELETE'])
+@login_required
+def bookmarks():
+    db = db_instance.get_db()
+    user_id = session['user_id']
+
+    if request.method == 'GET':
+        cur = db.execute("SELECT * FROM bookmarks WHERE user_id = ? ORDER BY timestamp DESC", (user_id,))
+        rows = [dict(row) for row in cur.fetchall()]
+        # Return just the link list for efficient checking on frontend, OR full objects for display
+        return jsonify(rows)
+
+    data = request.json
+    article = data.get('article')
+    
+    if request.method == 'POST':
+        # Create Command
+        cmd = AddBookmarkCommand(db, user_id, article)
+        cmd.execute()
+        
+        # Save to history for Undo (Serialize simple data)
+        hist = session.get('command_history', [])
+        hist.append({'type': 'add', 'article': article})
+        session['command_history'] = hist[-5:] # Keep last 5 actions
+        
+        return jsonify({'success': True})
+
+    if request.method == 'DELETE':
+        # Create Command
+        cmd = RemoveBookmarkCommand(db, user_id, article)
+        cmd.execute()
+        
+        # Save to history
+        hist = session.get('command_history', [])
+        hist.append({'type': 'remove', 'article': article})
+        session['command_history'] = hist[-5:]
+        
+        return jsonify({'success': True})
+
+@app.route('/api/undo', methods=['POST'])
+@login_required
+def undo_action():
+    hist = session.get('command_history', [])
+    if not hist:
+        return jsonify({'success': False, 'message': 'Nothing to undo'})
+    
+    last_action = hist.pop()
+    session['command_history'] = hist
+    
+    db = db_instance.get_db()
+    user_id = session['user_id']
+    article = last_action['article']
+    
+    # Recreate the command and call UNDO
+    # Logic: If last action was 'add', undoing it means 'remove'
+    if last_action['type'] == 'add':
+        cmd = AddBookmarkCommand(db, user_id, article)
+        cmd.undo()
+    elif last_action['type'] == 'remove':
+        cmd = RemoveBookmarkCommand(db, user_id, article)
+        cmd.undo()
+        
+    return jsonify({'success': True})
+
 @app.route('/api/news', methods=['GET'])
 def get_news():
-    # 1. Fetch from Memory
     all_articles = news_fetcher.get_cached_articles()
     filtered = all_articles
     
-    # 2. Apply Category/Preference Filters (Primary Filter)
     filter_type = request.args.get('filter_type', 'All')
     filter_value = request.args.get('filter_value', '')
     
@@ -313,8 +440,10 @@ def get_news():
             if user and user['preferences']:
                 strategy = PreferenceStrategy()
                 filtered = strategy.filter(filtered, user['preferences'])
+    elif filter_type == 'Bookmarks':
+        # Special case: Don't use cached news, use DB bookmarks
+        pass 
 
-    # 3. Apply Search Filter (Secondary Filter)
     search_query = request.args.get('search', '').strip()
     if search_query:
         search_strategy = SearchStrategy()

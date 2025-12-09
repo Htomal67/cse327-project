@@ -4,13 +4,13 @@ const state = {
     view: 'login',
     sources: [],
     articles: [],
+    bookmarks: [], // NEW: Store bookmark links for easy checking
     activeFilter: 'My Feed',
     searchQuery: '',
     categories: ['Politics', 'Sports', 'Technology', 'Business', 'Entertainment', 'Health', 'General'],
     theme: localStorage.getItem('theme') || 'light'
 };
 
-// --- THEME MANAGEMENT ---
 function initTheme() {
     if (state.theme === 'dark') {
         document.body.classList.add('dark-mode');
@@ -29,7 +29,7 @@ window.toggleTheme = () => {
 
 // --- UI HELPERS ---
 
-// Debounce Function: Waits for user to stop typing before firing
+// Debounce
 function debounce(func, wait) {
     let timeout;
     return function executedFunction(...args) {
@@ -41,6 +41,32 @@ function debounce(func, wait) {
         timeout = setTimeout(later, wait);
     };
 }
+
+// Toast Notification
+window.showToast = (message, showUndo = false) => {
+    // Remove existing toast
+    const existing = document.querySelector('.toast-container');
+    if (existing) existing.remove();
+
+    const container = document.createElement('div');
+    container.className = 'toast-container animate-fade-in';
+    
+    let html = `<span>${message}</span>`;
+    if (showUndo) {
+        html += `<button onclick="window.undoLastAction()" class="undo-btn">UNDO</button>`;
+    }
+    
+    container.innerHTML = html;
+    document.body.appendChild(container);
+
+    // Auto hide after 4 seconds
+    setTimeout(() => {
+        if (container) {
+            container.style.opacity = '0';
+            setTimeout(() => container.remove(), 300);
+        }
+    }, 4000);
+};
 
 window.togglePassword = (inputId, iconElement) => {
     const input = document.getElementById(inputId);
@@ -69,14 +95,26 @@ window.toggleSidebar = () => {
 
 class UIFactory {
     static createNewsCard(article) {
+        // Check if bookmarked
+        const isBookmarked = state.bookmarks.includes(article.link);
+        const heartIcon = isBookmarked ? 'ph-fill' : 'ph';
+        const heartColor = isBookmarked ? 'color: #e11d48;' : '';
+
         const div = document.createElement('div');
         div.className = 'card';
+        // Encode article data to pass to function
+        const articleJson = encodeURIComponent(JSON.stringify(article));
+        
         div.innerHTML = `
             <div class="card-img-wrapper">
                 <i class="ph ph-newspaper"></i>
                 <img src="${article.image}" 
                      onerror="this.style.display='none'; this.parentElement.classList.add('error');"
                      alt="News Image">
+                <!-- Bookmark Button -->
+                <button class="bookmark-btn" onclick="window.toggleBookmark(this, '${articleJson}')">
+                    <i class="ph-heart ${heartIcon}" style="${heartColor}"></i>
+                </button>
             </div>
             <div class="card-body">
                 <div class="tag">${article.category} • ${article.source}</div>
@@ -101,12 +139,15 @@ async function apiCall(endpoint, method = 'GET', body = null) {
     return res.json();
 }
 
+// --- LOGIC ---
+
 async function checkSession() {
     initTheme(); 
     try {
         const res = await apiCall('check_auth');
         if (res.authenticated) {
             state.user = res.user;
+            await loadBookmarks(); // Load bookmarks first
             if (state.user.role === 'admin') {
                 loadAdminDashboard();
             } else if (!state.user.preferences) {
@@ -123,6 +164,55 @@ async function checkSession() {
     }
 }
 
+async function loadBookmarks() {
+    const bks = await apiCall('bookmarks');
+    state.bookmarks = bks.map(b => b.link);
+}
+
+// NEW: Toggle Bookmark
+window.toggleBookmark = async (btn, articleJson) => {
+    // Prevent bubbling if clicking button
+    if(event) event.stopPropagation();
+    
+    const article = JSON.parse(decodeURIComponent(articleJson));
+    const icon = btn.querySelector('i');
+    
+    // Optimistic UI update
+    const isAdding = !icon.classList.contains('ph-fill');
+    
+    if (isAdding) {
+        icon.classList.add('ph-fill');
+        icon.style.color = '#e11d48';
+        state.bookmarks.push(article.link);
+        await apiCall('bookmarks', 'POST', { article });
+        showToast('Added to Read Later', true);
+    } else {
+        icon.classList.remove('ph-fill');
+        icon.style.color = '';
+        state.bookmarks = state.bookmarks.filter(l => l !== article.link);
+        await apiCall('bookmarks', 'DELETE', { article });
+        showToast('Removed from Read Later', true);
+        
+        // If we are currently viewing Read Later, remove card immediately
+        if (state.activeFilter === 'Read Later') {
+            loadDashboard(false);
+        }
+    }
+};
+
+// NEW: Undo Action
+window.undoLastAction = async () => {
+    const res = await apiCall('undo', 'POST');
+    if (res.success) {
+        showToast('Action undone');
+        await loadBookmarks(); // Refresh list
+        loadDashboard(false); // Refresh UI
+    } else {
+        showToast('Nothing to undo');
+    }
+};
+
+// ... Render Login/Preferences logic remains same ...
 function renderLogin() {
     const app = document.getElementById('app');
     app.innerHTML = `
@@ -190,6 +280,7 @@ async function handleAuth(e) {
     if (res.success) {
         if (mode === 'login') {
             state.user = res.user;
+            await loadBookmarks();
             if (state.user.role === 'admin') {
                 loadAdminDashboard();
             } else if (!state.user.preferences) {
@@ -244,14 +335,11 @@ function renderPreferences() {
     render();
 }
 
-// --- SEARCH HANDLING ---
-
-// 1. Debounce API calls to prevent flickering and server load
+// Search
 const performSearch = debounce(() => {
-    loadDashboard(false); // Pass false to indicate we don't want to redraw the shell
+    loadDashboard(false); 
 }, 300);
 
-// 2. Input handler updates state immediately, triggers delayed fetch
 window.handleSearch = (e) => {
     state.searchQuery = e.target.value;
     performSearch();
@@ -260,34 +348,34 @@ window.handleSearch = (e) => {
 async function loadDashboard(renderShell = true) {
     state.view = 'dashboard';
     
-    let query = '';
-    if (state.activeFilter === 'My Feed') {
-        query = '?filter_type=Preferences';
-    } else if (state.activeFilter !== 'All') {
-        query = `?filter_type=Category&filter_value=${state.activeFilter}`;
+    // Logic for deciding what to fetch
+    if (state.activeFilter === 'Read Later') {
+        state.articles = await apiCall('bookmarks');
     } else {
-        query = '?filter_type=All';
-    }
+        let query = '';
+        if (state.activeFilter === 'My Feed') {
+            query = '?filter_type=Preferences';
+        } else if (state.activeFilter !== 'All') {
+            query = `?filter_type=Category&filter_value=${state.activeFilter}`;
+        } else {
+            query = '?filter_type=All';
+        }
 
-    if (state.searchQuery) {
-        query += `&search=${encodeURIComponent(state.searchQuery)}`;
+        if (state.searchQuery) {
+            query += `&search=${encodeURIComponent(state.searchQuery)}`;
+        }
+        state.articles = await apiCall(`news${query}`);
     }
-
-    state.articles = await apiCall(`news${query}`);
     
-    // Check if the dashboard structure is already there
     const app = document.getElementById('app');
     const dashboardExists = app.querySelector('.dashboard') && !app.querySelector('.settings-container');
 
     if (renderShell && !dashboardExists) {
         renderDashboardStructure();
     }
-    
-    // Always update content
     updateDashboardContent();
 }
 
-// NEW: Draws the static Sidebar and Header ONCE
 function renderDashboardStructure() {
     const app = document.getElementById('app');
     
@@ -304,13 +392,17 @@ function renderDashboardStructure() {
                 </div>
 
                 <div id="sidebar-cats" style="display: flex; flex-direction: column; gap: 5px; flex: 1;">
-                    <!-- Categories injected via JS or static -->
                     <button class="cat-btn" data-cat="My Feed" onclick="setFilter('My Feed')">
                         <i class="ph ph-star" style="color: gold;"></i> For You
                     </button>
                     <button class="cat-btn" data-cat="All" onclick="setFilter('All')">
                         <i class="ph ph-squares-four"></i> All News
                     </button>
+                    <!-- NEW: Read Later Button -->
+                    <button class="cat-btn" data-cat="Read Later" onclick="setFilter('Read Later')">
+                        <i class="ph ph-bookmark-simple"></i> Read Later
+                    </button>
+
                     <div style="margin: 1rem 0; font-size: 0.75rem; color: var(--text-light); font-weight: bold; text-transform: uppercase; padding-left: 12px;">Categories</div>
                     ${state.categories.map(cat => `
                         <button class="cat-btn" data-cat="${cat}" onclick="setFilter('${cat}')">
@@ -332,7 +424,6 @@ function renderDashboardStructure() {
                         <button class="menu-btn" onclick="toggleSidebar()">
                             <i class="ph ph-list"></i>
                         </button>
-                        <!-- Search Bar -->
                         <div class="search-bar-container">
                             <i class="ph ph-magnifying-glass search-icon"></i>
                             <input type="text" class="search-input" 
@@ -357,35 +448,31 @@ function renderDashboardStructure() {
                     <span id="page-date" style="font-size: 0.85rem; color: var(--text-light);"></span>
                 </div>
 
-                <div class="news-grid" id="newsGrid">
-                    <!-- Cards injected here -->
-                </div>
+                <div class="news-grid" id="newsGrid"></div>
             </div>
         </div>
     `;
 }
 
-// NEW: Updates only the dynamic content areas
 function updateDashboardContent() {
-    // 1. Update Title & Date
     const titleEl = document.getElementById('page-title');
     const dateEl = document.getElementById('page-date');
     
     if (titleEl) {
-        titleEl.textContent = state.activeFilter === 'My Feed' ? 'Your Personal Feed' : state.activeFilter;
+        if(state.activeFilter === 'Read Later') titleEl.textContent = 'Saved Articles';
+        else titleEl.textContent = state.activeFilter === 'My Feed' ? 'Your Personal Feed' : state.activeFilter;
+        
         if (state.searchQuery) titleEl.textContent = `Results for "${state.searchQuery}"`;
     }
     if (dateEl) {
         dateEl.textContent = new Date().toLocaleDateString('en-US', { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' });
     }
 
-    // 2. Update Sidebar Active State
     document.querySelectorAll('.cat-btn').forEach(btn => {
         btn.classList.remove('active');
         if (btn.dataset.cat === state.activeFilter) btn.classList.add('active');
     });
 
-    // 3. Update Grid
     const grid = document.getElementById('newsGrid');
     if (!grid) return;
     
@@ -394,7 +481,7 @@ function updateDashboardContent() {
         grid.innerHTML = `
             <div style="text-align: center; grid-column: 1/-1; padding: 4rem; color: var(--text-light);">
                 <i class="ph ph-magnifying-glass" style="font-size: 3rem; margin-bottom: 1rem; display: block; opacity: 0.5;"></i>
-                <p>No news found for this criteria.</p>
+                <p>No news found.</p>
             </div>
         `;
     } else {
@@ -406,16 +493,14 @@ function updateDashboardContent() {
 
 window.setFilter = (filter) => {
     state.activeFilter = filter;
-    state.searchQuery = ''; // Clear search when switching tabs
-    
-    // Clear search input visually if it exists
+    state.searchQuery = ''; 
     const searchInput = document.querySelector('.search-input');
     if (searchInput) searchInput.value = '';
 
     if (window.innerWidth < 768) {
         toggleSidebar();
     }
-    loadDashboard(); // Will trigger structure update because filter changed
+    loadDashboard();
 };
 
 function loadSettings() {
